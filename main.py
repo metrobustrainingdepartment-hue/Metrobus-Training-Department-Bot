@@ -6,9 +6,6 @@ import zoneinfo
 import discord
 
 from discord.ext import commands
-import nest_asyncio
-
-nest_asyncio.apply()
 
 # --- Version & Bot Metadata ---
 BOT_VERSION = "1.1.2"
@@ -1255,8 +1252,7 @@ async def delete(ctx, message_id: int, target_channel_id: int = None):
   except Exception as e:
     await ctx.send(f"Error deleting message: {e}")
 
-TOKEN = os.getenv("DISCORD_TOKEN")
-if not TOKEN:
-    raise ValueError("DISCORD_TOKEN environment variable is missing!")
+
+TOKEN = os.getenv("DISCORD_TOKEN")  
 
 bot.run(TOKEN)
