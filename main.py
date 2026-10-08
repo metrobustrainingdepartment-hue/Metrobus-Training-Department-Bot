@@ -34,8 +34,7 @@ REACTION_ROLE_EMOJI_ID = int(os.getenv("REACTION_ROLE_EMOJI_ID", "15550749078875
 
 # Bot Status & Version Definitions
 BOT_VERSION = "1.0"
-BOT_STAGE = "Public Release"
-LAST_UPDATE = "20261008 1649"
+BOT_LAST_UPDATED = "20261008 1655"
 
 # Bot Setup with explicitly enabled reaction intents
 intents = discord.Intents.default()
@@ -304,7 +303,7 @@ async def help_cmd(ctx: commands.Context):
     )
 
     # Public Available Commands
-    public_cmds = "`!version` - Displays current bot version and testing stage."
+    public_cmds = "`!version` - Displays current bot version and last update date."
     embed.add_field(name="Public Commands", value=public_cmds, inline=False)
 
     is_tdp = False
@@ -314,7 +313,7 @@ async def help_cmd(ctx: commands.Context):
         is_dh = has_role_or_above(ctx.author, DEPARTMENT_HEAD_ROLE_ID)
         is_tdp = is_dh or has_role_or_above(ctx.author, TRAINING_DEPT_ROLE_ID)
 
-    # Training Department Pegrsonnel Commands
+    # Training Department Personnel Commands
     if is_tdp:
         tdp_cmds = (
             "`!announce <PCV/SD> <YYYYMMDD> <HHMM> <Quota>` - Post a training session announcement.\n"
@@ -357,7 +356,7 @@ async def error_cmd(ctx: commands.Context):
 
 @bot.command(name="version")
 async def version(ctx: commands.Context):
-    await ctx.send(f"**Bot Version:** {BOT_VERSION}\n**Stage:** {BOT_STAGE}\n**Last updated on:** {LAST_UPDATE}")
+    await ctx.send(f"**Bot Version:** {BOT_VERSION}\n**Last updated on:** {BOT_LAST_UPDATED}")
 
 @bot.command(name="delete")
 @is_department_head()
@@ -755,7 +754,7 @@ async def update_error(ctx: commands.Context, error: Exception):
         pass
     else:
         await ctx.send("Wrong format! Please use !update <variable> <value> 701")
-
+        
 TOKEN = os.getenv("DISCORD_TOKEN")  
 
 bot.run(TOKEN)
