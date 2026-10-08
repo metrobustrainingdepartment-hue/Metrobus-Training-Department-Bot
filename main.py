@@ -1,1257 +1,759 @@
-import asyncio
-import datetime
-import json
 import os
-import zoneinfo
+import json
+import asyncio
+from datetime import datetime, timezone, timedelta
 import discord
-
 from discord.ext import commands
+import nest_asyncio
 
-# --- Version & Bot Metadata ---
-BOT_VERSION = "1.1.2"
-BOT_RELEASE_DATE = "01/09/2026"
+nest_asyncio.apply()
 
-# --- Config & Initialization ---
+# File path for saving active sessions state across restarts
+SESSIONS_FILE = "sessions.json"
+
+# Guild
+GUILD_ID = int(os.getenv("GUILD_ID", "1554533436033597550"))
+
+# Channels
+PUBLIC_ANNOUNCEMENT_CHANNEL_ID = int(os.getenv("PUBLIC_ANNOUNCEMENT_CHANNEL_ID", "1555067926774677525"))
+INSTRUCTOR_COMM_CHANNEL_ID = int(os.getenv("INSTRUCTOR_COMM_CHANNEL_ID", "1554825629030027274"))
+LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "1535668588361416704"))
+
+# Management & Staff Roles
+DEPARTMENT_HEAD_ROLE_ID = int(os.getenv("DEPARTMENT_HEAD_ROLE_ID", "1554534391466823781"))
+TRAINING_DEPT_ROLE_ID = int(os.getenv("TRAINING_DEPT_ROLE_ID", "1554535058805891164"))
+
+# Announcement Ping Roles
+PCV_DRIVER_ROLE_ID = int(os.getenv("PCV_DRIVER_ROLE_ID", "1554535379992842310"))
+TD_DRIVER_ROLE_ID = int(os.getenv("TD_DRIVER_ROLE_ID", "1554845505975226389"))
+
+# Reaction / Self-Assignable Roles
+SHIFT_PING_ROLE_ID = int(os.getenv("SHIFT_PING_ROLE_ID", "1556564459227713556"))
+REACTION_ROLE_MESSAGE_ID = int(os.getenv("REACTION_ROLE_MESSAGE_ID", "1557671185313959987"))
+REACTION_ROLE_EMOJI_ID = int(os.getenv("REACTION_ROLE_EMOJI_ID", "1555074907887501363"))
+
+# Bot Status & Version Definitions
+BOT_VERSION = "1.9.4"
+BOT_STAGE = "Testing Stage"
+
+# Bot Setup with explicitly enabled reaction intents
 intents = discord.Intents.default()
 intents.message_content = True
-intents.dm_messages = True
-
+intents.members = True
+intents.presences = True
+intents.reactions = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
-ANNOUNCEMENT_CHANNEL_ID = 1223678863754657853
-REMINDER_CHANNEL_ID = 1300484583170511052
-LOG_CHANNEL_ID = 1535668588361416704
+# Active sessions dictionary keyed by host_id (int)
+sessions = {}
 
-TRAINING_DEPT_ROLE_ID = 1240213202734678027
-DEPT_MANAGER_ROLE_ID = 1430206480669216868
-TRAINEE_ROLE_PING = "<@&1531657175359820007>"
-
-YOUR_USER_ID = 946346020902674472
-ALLOWED_GUILD_ID = 1404026674483564574
-
-# Reaction Role IDs
-TRAINING_PING_MESSAGE_ID = 1532047216846311424
-TRAINING_PING_EMOJI_ID = 1278726581627650196
-TRAINING_PING_ROLE_ID = 1531657175359820007
-
-SHIFT_PING_MESSAGE_ID = 1532048683695079516
-SHIFT_PING_EMOJI_ID = 1224031772514455675
-SHIFT_PING_ROLE_ID = 1531888689334976623
-
-HKT = zoneinfo.ZoneInfo("Asia/Hong_Kong")
-STATE_FILE = "trainings_state.json"
-
-trainings = {}
-user_active_dms = {}
-play_targets = {}
-play_cooldowns = {}
-
-
-# --- Persistence Helpers ---
-def save_trainings_state():
-  state_data = {}
-  for host_id, data in trainings.items():
-    state_data[str(host_id)] = {
-        "training_dt": data["training_dt"].isoformat(),
-        "host_mention": data["host_mention"],
-        "quota": data["quota"],
-        "link_posted": data.get("link_posted", False),
-        "is_locked": data.get("is_locked", False),
-        "ping_message_id": (
-            data["ping_message"].id if data.get("ping_message") else None
-        ),
-        "announcement_message_id": (
-            data["announcement_message"].id
-            if data.get("announcement_message")
-            else None
-        ),
-        "link_message_id": (
-            data["link_message"].id if data.get("link_message") else None
-        ),
-        "posted_message_ids": [
-            msg.id for msg in data.get("posted_messages", []) if msg
-        ],
-    }
-
-  try:
-    with open(STATE_FILE, "w") as f:
-      json.dump(state_data, f, indent=4)
-  except Exception as e:
-    print(f"Error saving training state: {e}")
-
-
-async def load_trainings_state():
-  if not os.path.exists(STATE_FILE):
-    return
-
-  try:
-    with open(STATE_FILE, "r") as f:
-      state_data = json.load(f)
-
-    announcement_channel = bot.get_channel(
-        ANNOUNCEMENT_CHANNEL_ID
-    ) or await bot.fetch_channel(ANNOUNCEMENT_CHANNEL_ID)
-    if not announcement_channel:
-      return
-
-    for host_id_str, data in state_data.items():
-      host_id = int(host_id_str)
-      training_dt = datetime.datetime.fromisoformat(data["training_dt"])
-
-      ping_msg = None
-      if data.get("ping_message_id"):
-        try:
-          ping_msg = await announcement_channel.fetch_message(
-              data["ping_message_id"]
-          )
-        except Exception:
-          pass
-
-      ann_msg = None
-      if data.get("announcement_message_id"):
-        try:
-          ann_msg = await announcement_channel.fetch_message(
-              data["announcement_message_id"]
-          )
-        except Exception:
-          pass
-
-      link_msg = None
-      if data.get("link_message_id"):
-        try:
-          link_msg = await announcement_channel.fetch_message(
-              data["link_message_id"]
-          )
-        except Exception:
-          pass
-
-      posted_msgs = []
-      for mid in data.get("posted_message_ids", []):
-        try:
-          m = await announcement_channel.fetch_message(mid)
-          posted_msgs.append(m)
-        except Exception:
-          pass
-
-      trainings[host_id] = {
-          "ping_message": ping_msg,
-          "announcement_message": ann_msg,
-          "posted_messages": posted_msgs,
-          "training_dt": training_dt,
-          "host_mention": data["host_mention"],
-          "quota": data["quota"],
-          "link_message": link_msg,
-          "link_posted": data.get("link_posted", False),
-          "is_locked": data.get("is_locked", False),
-          "reminder_task": asyncio.create_task(
-              send_reminder(data["host_mention"], training_dt)
-          ),
-          "auto_lock_task": asyncio.create_task(
-              schedule_auto_lock(host_id, training_dt)
-          ),
-      }
-    print("Successfully restored active training session state.")
-  except Exception as e:
-    print(f"Error loading training state: {e}")
-
-
-# --- Permission Helpers ---
-def user_has_role_or_higher_position(
-    member: discord.Member, target_role_id: int
-) -> bool:
-  if member.id == YOUR_USER_ID or member.guild_permissions.administrator:
-    return True
-
-  target_role = member.guild.get_role(target_role_id)
-  if not target_role:
-    return False
-
-  return any(role.position >= target_role.position for role in member.roles)
-
-
-def has_role_or_above_position(required_role_id: int):
-
-  async def predicate(ctx):
-    if not isinstance(ctx.author, discord.Member):
-      return False
-
-    if user_has_role_or_higher_position(ctx.author, required_role_id):
-      return True
-
-    await ctx.send("You don't have the permission to run this command!")
-    return False
-
-  return commands.check(predicate)
-
-
-def is_u47is_only():
-
-  async def predicate(ctx):
-    return ctx.author.id == YOUR_USER_ID
-
-  return commands.check(predicate)
-
-
-def is_dept_manager():
-
-  def check(author):
-    if not isinstance(author, discord.Member):
-      return False
-    return user_has_role_or_higher_position(author, DEPT_MANAGER_ROLE_ID)
-
-  return check
-
-
-# ==============================================================================
-# 1. BACKGROUND FEATURES & REACTION ROLES
-# ==============================================================================
-
-
-async def send_reminder(host_mention, target_dt):
-  now = datetime.datetime.now(HKT)
-  reminder_dt = target_dt - datetime.timedelta(minutes=20)
-  delay = (reminder_dt - now).total_seconds()
-
-  reminder_channel = bot.get_channel(REMINDER_CHANNEL_ID)
-  if delay > 0:
-    await asyncio.sleep(delay)
-    if reminder_channel:
-      await reminder_channel.send(
-          f"Reminder: {host_mention} Your MTB PCV Training starts in 20"
-          " minutes! Please prepare to host on time."
-      )
-  else:
-    if reminder_channel:
-      await reminder_channel.send(
-          f"Reminder: {host_mention} Your MTB PCV Training starts in less than"
-          " 20 minutes! Please prepare to host on time."
-      )
-
-
-async def schedule_auto_lock(host_id, target_dt):
-  now = datetime.datetime.now(HKT)
-  delay = (target_dt - now).total_seconds()
-
-  if delay > 0:
-    await asyncio.sleep(delay)
-
-  training = trainings.get(host_id)
-  if training and training.get("link_message"):
+def save_sessions_to_file():
+    data = {}
+    for host_id, session in sessions.items():
+        data[str(host_id)] = {
+            "active": session["active"],
+            "session_type": session["session_type"],
+            "date_str": session["date_str"],
+            "time_str": session["time_str"],
+            "quota": session["quota"],
+            "unix_timestamp": session["unix_timestamp"],
+            "host_id": session["host_id"],
+            "announcement_msg_id": session["announcement_msg_id"],
+            "ping_msg_id": session["ping_msg_id"],
+            "reminder_sent": session["reminder_sent"],
+            "link_ping_msg_id": session["link_ping_msg_id"],
+            "link_msg_id": session["link_msg_id"],
+            "thread_id": session["thread_id"],
+            "server_locked": session["server_locked"],
+            "lock_msg_id": session["lock_msg_id"],
+            "track_date_key": session["track_date_key"],
+            "messages_to_clear": session["messages_to_clear"]
+        }
     try:
-      link_msg = training["link_message"]
-      announcement_channel = link_msg.channel
-      await link_msg.delete()
-      if link_msg in training["posted_messages"]:
-        training["posted_messages"].remove(link_msg)
-
-      training["link_message"] = None
-      training["is_locked"] = True
-      save_trainings_state()
-
-      embed = discord.Embed(
-          title="Server Locked",
-          description=(
-              "Server locked due to starting time reached. Please join the"
-              " next session if you failed to join this session."
-          ),
-          color=discord.Color.red(),
-      )
-      lock_msg = await announcement_channel.send(embed=embed)
-      training["posted_messages"].append(lock_msg)
-      save_trainings_state()
+        with open(SESSIONS_FILE, "w") as f:
+            json.dump(data, f)
     except Exception as e:
-      print(f"Error during auto lock: {e}")
+        print(f"Error saving session state: {e}")
 
+def load_sessions_from_file():
+    if not os.path.exists(SESSIONS_FILE):
+        return
+    try:
+        with open(SESSIONS_FILE, "r") as f:
+            data = json.load(f)
+            for host_id_str, s in data.items():
+                host_id = int(host_id_str)
+                sessions[host_id] = {
+                    "active": s.get("active", False),
+                    "session_type": s.get("session_type"),
+                    "date_str": s.get("date_str"),
+                    "time_str": s.get("time_str"),
+                    "quota": s.get("quota"),
+                    "unix_timestamp": s.get("unix_timestamp"),
+                    "host_id": host_id,
+                    "announcement_msg_id": s.get("announcement_msg_id"),
+                    "ping_msg_id": s.get("ping_msg_id"),
+                    "reminder_sent": s.get("reminder_sent", False),
+                    "reminder_task": None,
+                    "auto_lock_task": None,
+                    "link_ping_msg_id": s.get("link_ping_msg_id"),
+                    "link_msg_id": s.get("link_msg_id"),
+                    "thread_id": s.get("thread_id"),
+                    "server_locked": s.get("server_locked", False),
+                    "lock_msg_id": s.get("lock_msg_id"),
+                    "track_date_key": s.get("track_date_key"),
+                    "messages_to_clear": s.get("messages_to_clear", [])
+                }
+    except Exception as e:
+        print(f"Error loading session state: {e}")
+
+# Helper functions
+def has_role_or_above(member: discord.Member, target_role_id: int) -> bool:
+    if member.guild_permissions.administrator:
+        return True
+    target_role = member.guild.get_role(target_role_id)
+    if not target_role:
+        return False
+    return any(role.position >= target_role.position for role in member.roles)
+
+def is_training_or_head():
+    async def predicate(ctx: commands.Context) -> bool:
+        if not isinstance(ctx.author, discord.Member):
+            await ctx.send("Insufficient rank. `703`")
+            return False
+        if has_role_or_above(ctx.author, DEPARTMENT_HEAD_ROLE_ID) or has_role_or_above(ctx.author, TRAINING_DEPT_ROLE_ID):
+            return True
+        await ctx.send("Insufficient rank. `703`")
+        return False
+    return commands.check(predicate)
+
+def is_department_head():
+    async def predicate(ctx: commands.Context) -> bool:
+        if not isinstance(ctx.author, discord.Member):
+            await ctx.send("Insufficient rank. `703`")
+            return False
+        if has_role_or_above(ctx.author, DEPARTMENT_HEAD_ROLE_ID):
+            return True
+        await ctx.send("Insufficient rank. `703`")
+        return False
+    return commands.check(predicate)
+
+def create_announcement_embed(session_type: str, unix_timestamp: int, host_mention: str, quota: int) -> discord.Embed:
+    embed = discord.Embed(
+        title=f"NEXTransit {session_type.upper()} Training - <t:{unix_timestamp}:F>",
+        color=discord.Color.blue()
+    )
+    embed.add_field(name="Host", value=host_mention, inline=True)
+    embed.add_field(name="Trainee Quota", value=str(quota), inline=True)
+    reminders = (
+        "1. Please join the NEXTransit Roblox community\n"
+        "2. Link will be released 10 minutes before the starting time\n"
+        "3. The training may start earlier if training quota is reached"
+    )
+    embed.add_field(name="Reminders before joining:", value=reminders, inline=False)
+    return embed
+
+async def schedule_training_reminder(host_id: int, host_mention: str, session_type: str, start_timestamp: int):
+    now_ts = datetime.now(timezone.utc).timestamp()
+    reminder_ts = start_timestamp - 1200  # 20 minutes before start time
+    
+    internal_channel = bot.get_channel(INSTRUCTOR_COMM_CHANNEL_ID)
+    if not internal_channel:
+        try:
+            internal_channel = await bot.fetch_channel(INSTRUCTOR_COMM_CHANNEL_ID)
+        except Exception:
+            return
+
+    if now_ts >= reminder_ts:
+        msg = f"Training reminder: {host_mention} Your {session_type} training starts in less than 20 minutes! Please prepare to host punctually."
+        reminder_msg = await internal_channel.send(msg)
+        if host_id in sessions:
+            sessions[host_id]["reminder_sent"] = True
+            if reminder_msg:
+                sessions[host_id]["messages_to_clear"].append(reminder_msg.id)
+            save_sessions_to_file()
+    else:
+        wait_seconds = reminder_ts - now_ts
+        try:
+            await asyncio.sleep(wait_seconds)
+            msg = f"Training reminder: {host_mention} Your {session_type} training starts in 20 minutes! Please prepare to host punctually."
+            reminder_msg = await internal_channel.send(msg)
+            if host_id in sessions:
+                sessions[host_id]["reminder_sent"] = True
+                if reminder_msg:
+                    sessions[host_id]["messages_to_clear"].append(reminder_msg.id)
+                save_sessions_to_file()
+        except asyncio.CancelledError:
+            pass
+
+async def schedule_auto_lock(host_id: int, start_timestamp: int):
+    now_ts = datetime.now(timezone.utc).timestamp()
+    wait_seconds = start_timestamp - now_ts
+    if wait_seconds > 0:
+        try:
+            await asyncio.sleep(wait_seconds)
+        except asyncio.CancelledError:
+            return
+
+    session = sessions.get(host_id)
+    if session and session["active"] and not session["server_locked"] and session["link_msg_id"]:
+        ann_channel = bot.get_channel(PUBLIC_ANNOUNCEMENT_CHANNEL_ID) or await bot.fetch_channel(PUBLIC_ANNOUNCEMENT_CHANNEL_ID)
+        if ann_channel:
+            for msg_id in [session["link_msg_id"], session["link_ping_msg_id"]]:
+                if msg_id:
+                    try:
+                        msg_to_del = await ann_channel.fetch_message(msg_id)
+                        await msg_to_del.delete()
+                    except Exception:
+                        pass
+            
+            embed = discord.Embed(
+                title="Server Locked",
+                description="Server locked due to starting time reached. Please join the next session if you failed to join this session.",
+                color=discord.Color.red()
+            )
+            lock_msg = await ann_channel.send(embed=embed)
+            session["server_locked"] = True
+            session["lock_msg_id"] = lock_msg.id
+            session["messages_to_clear"].append(lock_msg.id)
+            save_sessions_to_file()
+
+# --- Events ---
 
 @bot.event
 async def on_ready():
-  print(f"Logged in as {bot.user}!")
-  await load_trainings_state()
+    await bot.change_presence(status=discord.Status.online, activity=discord.Game(name="NEXTransit Training"))
+    load_sessions_from_file()
 
+    for host_id, session in sessions.items():
+        if session["active"] and session["unix_timestamp"]:
+            host_mention = f"<@{host_id}>"
+            
+            if not session["reminder_sent"]:
+                session["reminder_task"] = asyncio.create_task(
+                    schedule_training_reminder(host_id, host_mention, session["session_type"], session["unix_timestamp"])
+                )
+            
+            if not session["server_locked"]:
+                session["auto_lock_task"] = asyncio.create_task(
+                    schedule_auto_lock(host_id, session["unix_timestamp"])
+                )
+
+    print(f"Bot connected successfully as {bot.user} and status set to Online!")
 
 @bot.event
-async def on_message(message: discord.Message):
-  if message.author.bot:
-    return
-
-  # Auto-Reply for Play Targets
-  if (
-      message.guild
-      and message.guild.id == ALLOWED_GUILD_ID
-      and message.author.id in play_targets
-  ):
-    data = play_targets[message.author.id]
-    try:
-      if data["type"] == "sticker":
-        await message.reply(stickers=[data["content"]], mention_author=False)
-      elif data["type"] == "image_url":
-        embed = discord.Embed()
-        embed.set_image(url=data["content"])
-        await message.reply(embed=embed, mention_author=False)
-      else:
-        await message.reply(content=data["content"], mention_author=False)
-    except Exception as e:
-      print(f"Error in play auto-reply: {e}")
-
-  # Incoming DM Listener
-  if isinstance(message.channel, discord.DMChannel):
-    channel = bot.get_channel(LOG_CHANNEL_ID)
-    if not channel:
-      try:
-        channel = await bot.fetch_channel(LOG_CHANNEL_ID)
-      except Exception:
-        print(f"Error: Log channel {LOG_CHANNEL_ID} not found.")
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    if payload.message_id != REACTION_ROLE_MESSAGE_ID or payload.emoji.id != REACTION_ROLE_EMOJI_ID:
         return
 
-    is_new_session = message.author.id not in user_active_dms
+    guild = bot.get_guild(payload.guild_id) or await bot.fetch_guild(payload.guild_id)
+    if not guild:
+        return
 
-    if is_new_session:
-      user_active_dms[message.author.id] = True
-      welcome_msg = (
-          f"`{message.author.id}` has sent a new message to the Metrobus"
-          " Training Department Bot!"
-      )
-      await channel.send(welcome_msg)
-      try:
-        receipt_embed = discord.Embed(
-            title="Message Received",
-            description="Message received! Our staff will reply you shortly.",
-            color=discord.Color.green(),
-        )
-        await message.author.send(embed=receipt_embed)
-      except discord.Forbidden:
-        pass
+    role = guild.get_role(SHIFT_PING_ROLE_ID)
+    if not role:
+        return
 
-    embed = discord.Embed(
-        title="New DM Received",
-        description=(
-            message.content if message.content else "*[Attachment/File Only]*"
-        ),
-        color=discord.Color.blue(),
-        timestamp=message.created_at,
-    )
-    embed.set_author(
-        name=f"{message.author.name}",
-        icon_url=message.author.display_avatar.url,
-    )
-    embed.set_footer(
-        text=f"User ID: {message.author.id} | Message ID: {message.id}"
-    )
-
-    files = []
-    if message.attachments:
-      first_att = message.attachments[0]
-      if first_att.content_type and first_att.content_type.startswith("image/"):
-        embed.set_image(url=first_att.url)
-
-      for attachment in message.attachments:
+    member = payload.member
+    if not member:
         try:
-          files.append(await attachment.to_file())
+            member = await guild.fetch_member(payload.user_id)
+        except discord.NotFound:
+            return
+
+    if member and not member.bot:
+        try:
+            await member.add_roles(role)
+            print(f"Added role {role.name} to {member.display_name}")
         except Exception as e:
-          print(f"Error processing attachment: {e}")
-
-    await channel.send(embed=embed, files=files)
-    return
-
-  await bot.process_commands(message)
-
+            print(f"Failed to add role: {e}")
 
 @bot.event
-async def on_message_edit(before: discord.Message, after: discord.Message):
-  if isinstance(before.channel, discord.DMChannel) and not before.author.bot:
-    channel = bot.get_channel(LOG_CHANNEL_ID)
-    if channel:
-      embed = discord.Embed(
-          title="Message Edited in DM", color=discord.Color.gold()
-      )
-      embed.add_field(
-          name="Before",
-          value=before.content if before.content else "*None*",
-          inline=False,
-      )
-      embed.add_field(
-          name="After",
-          value=after.content if after.content else "*None*",
-          inline=False,
-      )
-      embed.set_footer(
-          text=f"User ID: {before.author.id} | Message ID: {before.id}"
-      )
-      await channel.send(embed=embed)
-
-
-@bot.event
-async def on_message_delete(message: discord.Message):
-  if isinstance(message.channel, discord.DMChannel) and not message.author.bot:
-    channel = bot.get_channel(LOG_CHANNEL_ID)
-    if channel:
-      embed = discord.Embed(
-          title="Message Deleted in DM",
-          description=(
-              message.content if message.content else "*[Attachment Deleted]*"
-          ),
-          color=discord.Color.red(),
-      )
-      embed.set_footer(
-          text=f"User ID: {message.author.id} | Message ID: {message.id}"
-      )
-
-      if message.attachments:
-        first_att = message.attachments[0]
-        if (
-            first_att.content_type
-            and first_att.content_type.startswith("image/")
-        ):
-          embed.set_image(url=first_att.url)
-
-      await channel.send(embed=embed)
-
-
-@bot.event
-async def on_raw_reaction_add(payload):
-  guild = bot.get_guild(payload.guild_id)
-  if not guild:
-    return
-
-  member = payload.member or guild.get_member(payload.user_id)
-  if not member or member.bot:
-    return
-
-  role_to_add_id = None
-  if (
-      payload.message_id == TRAINING_PING_MESSAGE_ID
-      and payload.emoji.id == TRAINING_PING_EMOJI_ID
-  ):
-    role_to_add_id = TRAINING_PING_ROLE_ID
-  elif (
-      payload.message_id == SHIFT_PING_MESSAGE_ID
-      and payload.emoji.id == SHIFT_PING_EMOJI_ID
-  ):
-    role_to_add_id = SHIFT_PING_ROLE_ID
-
-  if role_to_add_id:
-    role = guild.get_role(role_to_add_id)
-    if role:
-      try:
-        await member.add_roles(role)
-      except Exception as e:
-        print(f"Error adding role {role_to_add_id}: {e}")
-
-
-@bot.event
-async def on_raw_reaction_remove(payload):
-  guild = bot.get_guild(payload.guild_id)
-  if not guild:
-    return
-
-  member = guild.get_member(payload.user_id)
-  if not member:
-    try:
-      member = await guild.fetch_member(payload.user_id)
-    except Exception:
-      return
-
-  if not member or member.bot:
-    return
-
-  role_to_remove_id = None
-  if (
-      payload.message_id == TRAINING_PING_MESSAGE_ID
-      and payload.emoji.id == TRAINING_PING_EMOJI_ID
-  ):
-    role_to_remove_id = TRAINING_PING_ROLE_ID
-  elif (
-      payload.message_id == SHIFT_PING_MESSAGE_ID
-      and payload.emoji.id == SHIFT_PING_EMOJI_ID
-  ):
-    role_to_remove_id = SHIFT_PING_ROLE_ID
-
-  if role_to_remove_id:
-    role = guild.get_role(role_to_remove_id)
-    if role:
-      try:
-        await member.remove_roles(role)
-      except Exception as e:
-        print(f"Error removing role {role_to_remove_id}: {e}")
-
-
-# ==============================================================================
-# 2. GENERAL PUBLIC COMMANDS
-# ==============================================================================
-
-
-@bot.command()
-async def version(ctx):
-  """Usage: !version"""
-  await ctx.send(f"Version {BOT_VERSION}: Released {BOT_RELEASE_DATE}")
-
-
-@bot.command()
-async def training(ctx):
-  """Usage: !training"""
-  active_trainings = [
-      data for data in trainings.values() if not data.get("is_locked")
-  ]
-
-  if active_trainings:
-    next_training = min(active_trainings, key=lambda t: t["training_dt"])
-    unix_ts = int(next_training["training_dt"].timestamp())
-    timestamp_format = f"<t:{unix_ts}:f> (<t:{unix_ts}:R>)"
-    await ctx.send(
-        f"The next Metrobus Training for PCV is scheduled at {timestamp_format}"
-    )
-  else:
-    await ctx.send(
-        "Seems like there is no any training scheduled for now! You can go"
-        " ahead and get yourself the Training Ping role to receive"
-        " notification when one is being posted."
-    )
-
-
-@bot.command()
-async def help(ctx):
-  """Usage: !help"""
-  is_dm_or_u47is = (
-      isinstance(ctx.author, discord.Member)
-      and user_has_role_or_higher_position(ctx.author, DEPT_MANAGER_ROLE_ID)
-  )
-  is_training_dept = (
-      isinstance(ctx.author, discord.Member)
-      and user_has_role_or_higher_position(ctx.author, TRAINING_DEPT_ROLE_ID)
-  )
-  is_in_allowed_guild = ctx.guild and ctx.guild.id == ALLOWED_GUILD_ID
-
-  embed = discord.Embed(
-      title="Available Commands",
-      description="Here are the commands you have permission to use:",
-      color=discord.Color.blue(),
-  )
-
-  gen_cmds = (
-      "`!version` - Display bot version and release date.\n"
-      "`!training` - Display upcoming training schedule.\n"
-      "`!help` - Display available commands."
-  )
-  embed.add_field(name="Public Commands", value=gen_cmds, inline=False)
-
-  if is_in_allowed_guild:
-    children_cmds = (
-        "`!play <@user> <emoji/sticker/text/file>` - Auto-reply user's"
-        " messages with target content.\n"
-        "`!stopplay <@user>` - Stop auto-replying for a target user."
-    )
-    if ctx.author.id == YOUR_USER_ID:
-      children_cmds += (
-          "\n`!playlist` - View all active auto-reply target users."
-      )
-
-    embed.add_field(
-        name="U47is Children Commands", value=children_cmds, inline=False
-    )
-
-  if is_training_dept or is_dm_or_u47is:
-    training_cmds = (
-        "`!announce <DD/MM/YYYY> <HH:MM> <quota>` - Announce a training"
-        " session.\n"
-        "`!update <field> <value>` - Update session details (time, host,"
-        " traineequota).\n"
-        "`!link <server_link>` - Post the training server link.\n"
-        "`!full` - Set server status to FULL and remove link.\n"
-        "`!end` - End session and post detailed result reaction message."
-    )
-    embed.add_field(
-        name="Training Department Commands",
-        value=training_cmds,
-        inline=False,
-    )
-
-  if is_dm_or_u47is:
-    manager_cmds = (
-        "`!clear` - Clear active training session and feedback messages.\n"
-        "`!dm <user_id> [message]` - Send a Direct Message to a user (supports"
-        " attachments).\n"
-        "`!dmclose <user_id>` - Close DM ticket and notify user.\n"
-        "`!text <channel_id> <message>` - Post a message to a specific"
-        " channel.\n"
-        "`!delete <message_id> [channel_id]` - Delete a message by ID from"
-        " any channel."
-    )
-    embed.add_field(
-        name="Department Head / Management Commands",
-        value=manager_cmds,
-        inline=False,
-    )
-
-  await ctx.send(embed=embed)
-
-
-# ==============================================================================
-# 3. U47IS CHILDREN PLAY COMMANDS
-# ==============================================================================
-
-
-@bot.command()
-async def play(ctx, target_user: discord.Member = None, *, content: str = ""):
-  """Usage: !play <@user> <emoji/sticker/text/attachment>"""
-  if not ctx.guild or ctx.guild.id != ALLOWED_GUILD_ID:
-    return
-
-  if not target_user:
-    await ctx.send(
-        "Error: Please mention a valid user. Usage: `!play <@user> <content>`"
-    )
-    return
-
-  if ctx.author.id != YOUR_USER_ID:
-    now = datetime.datetime.now()
-    last_used = play_cooldowns.get(ctx.author.id)
-
-    if last_used and (now - last_used).total_seconds() < 60:
-      remaining = 60 - int((now - last_used).total_seconds())
-      await ctx.send(
-          f"Cooldown active! Please wait {remaining} seconds before using"
-          " `!play` again."
-      )
-      return
-
-    previous_targets = [
-        uid
-        for uid, data in play_targets.items()
-        if data.get("setter_id") == ctx.author.id
-    ]
-    for uid in previous_targets:
-      del play_targets[uid]
-
-    play_cooldowns[ctx.author.id] = now
-
-  asset_type = "text"
-  asset_content = content
-
-  if ctx.message.attachments:
-    asset_type = "image_url"
-    asset_content = ctx.message.attachments[0].url
-  elif ctx.message.stickers:
-    asset_type = "sticker"
-    asset_content = ctx.message.stickers[0]
-  elif not content:
-    await ctx.send(
-        "Error: Please provide text, an emoji, a sticker, or attach an image!"
-    )
-    return
-
-  play_targets[target_user.id] = {
-      "setter_id": ctx.author.id,
-      "type": asset_type,
-      "content": asset_content,
-  }
-
-  await ctx.send(f"Play mode enabled for {target_user.mention}!")
-
-
-@bot.command()
-async def stopplay(ctx, target_user: discord.Member = None):
-  """Usage: !stopplay <@user>"""
-  if not ctx.guild or ctx.guild.id != ALLOWED_GUILD_ID:
-    return
-
-  if not target_user:
-    await ctx.send(
-        "Error: Please mention a valid user. Usage: `!stopplay <@user>`"
-    )
-    return
-
-  if target_user.id in play_targets:
-    data = play_targets[target_user.id]
-    if (
-        ctx.author.id != YOUR_USER_ID
-        and data.get("setter_id") != ctx.author.id
-    ):
-      await ctx.send("You can only stop play mode for targets set by yourself!")
-      return
-
-    del play_targets[target_user.id]
-    await ctx.send(f"Play mode stopped for {target_user.mention}.")
-  else:
-    await ctx.send(f"{target_user.mention} is currently not in play mode.")
-
-
-@bot.command()
-@is_u47is_only()
-async def playlist(ctx):
-  """Usage: !playlist (Owner Only)"""
-  if not ctx.guild or ctx.guild.id != ALLOWED_GUILD_ID:
-    return
-
-  if not play_targets:
-    await ctx.send("There are currently no active play targets.")
-    return
-
-  embed = discord.Embed(
-      title="Active Play Targets List", color=discord.Color.purple()
-  )
-
-  for target_id, data in play_targets.items():
-    setter_mention = f"<@{data['setter_id']}>"
-    target_mention = f"<@{target_id}>"
-    content_display = (
-        data["content"].name
-        if data["type"] == "sticker"
-        else str(data["content"])
-    )
-
-    embed.add_field(
-        name=f"Target: {target_id}",
-        value=(
-            f"**Target User:** {target_mention}\n"
-            f"**Set By:** {setter_mention}\n"
-            f"**Type:** {data['type']}\n"
-            f"**Content:** {content_display}"
-        ),
-        inline=False,
-    )
-
-  await ctx.send(embed=embed)
-
-
-# ==============================================================================
-# 4. TRAINING DEPARTMENT COMMANDS
-# ==============================================================================
-
-
-@bot.command()
-@has_role_or_above_position(TRAINING_DEPT_ROLE_ID)
-async def announce(ctx, date_str: str, time_str: str, quota: str):
-  """Usage: !announce DD/MM/YYYY HH:MM Quota."""
-  try:
-    naive_dt = datetime.datetime.strptime(
-        f"{date_str} {time_str}", "%d/%m/%Y %H:%M"
-    )
-    hkt_dt = naive_dt.replace(tzinfo=HKT)
-  except ValueError:
-    await ctx.send(
-        "Invalid Date/Time format! Please use DD/MM/YYYY and HH:MM (e.g.,"
-        " 28/07/2026 20:00)."
-    )
-    return
-
-  host_id = ctx.author.id
-  host_mention = ctx.author.mention
-
-  if host_id in trainings:
-    if trainings[host_id].get("reminder_task"):
-      trainings[host_id]["reminder_task"].cancel()
-    if trainings[host_id].get("auto_lock_task"):
-      trainings[host_id]["auto_lock_task"].cancel()
-
-  unix_timestamp = int(hkt_dt.timestamp())
-  timestamp_format = f"<t:{unix_timestamp}:f> (<t:{unix_timestamp}:R>)"
-
-  embed = discord.Embed(
-      title=f"MTB PCV Training - {timestamp_format}", color=discord.Color.blue()
-  )
-  embed.add_field(name="Host", value=host_mention, inline=False)
-  embed.add_field(name="Trainee Quota", value=quota, inline=False)
-
-  target_channel = bot.get_channel(ANNOUNCEMENT_CHANNEL_ID)
-  if target_channel:
-    ping_msg = await target_channel.send(content=TRAINEE_ROLE_PING)
-    ann_msg = await target_channel.send(embed=embed)
-    await ctx.send("Announcement successfully posted!")
-
-    trainings[host_id] = {
-        "ping_message": ping_msg,
-        "announcement_message": ann_msg,
-        "posted_messages": [ping_msg, ann_msg],
-        "training_dt": hkt_dt,
-        "host_mention": host_mention,
-        "quota": quota,
-        "link_message": None,
-        "link_posted": False,
-        "is_locked": False,
-        "reminder_task": asyncio.create_task(
-            send_reminder(host_mention, hkt_dt)
-        ),
-        "auto_lock_task": asyncio.create_task(
-            schedule_auto_lock(host_id, hkt_dt)
-        ),
-    }
-    save_trainings_state()
-  else:
-    await ctx.send(
-        "Could not find <#1223678863754657853>. Please check permissions!"
-    )
-
-
-@bot.command()
-@has_role_or_above_position(TRAINING_DEPT_ROLE_ID)
-async def update(ctx, field: str, *, value: str):
-  """Usage:
-
-  !update time DD/MM/YYYY HH:MM !update host @User !update traineequota <quota>
-  """
-  host_id = ctx.author.id
-
-  if host_id not in trainings:
-    if is_dept_manager()(ctx.author) and len(trainings) > 0:
-      host_id = list(trainings.keys())[-1]
-    else:
-      await ctx.send("You haven't announced the training yet!")
-      return
-
-  training = trainings[host_id]
-
-  if training.get("is_locked"):
-    await ctx.send(
-        "The server is already locked! Updates are no longer allowed."
-    )
-    return
-
-  field_clean = field.lower().replace("_", "").replace(" ", "")
-  orig_unix = int(training["training_dt"].timestamp())
-  orig_timestamp_str = f"<t:{orig_unix}:f>"
-
-  if field_clean in ["time", "date", "datetime"]:
-    try:
-      parts = value.strip().split()
-      if len(parts) != 2:
-        raise ValueError
-      date_part, time_part = parts[0], parts[1]
-      naive_dt = datetime.datetime.strptime(
-          f"{date_part} {time_part}", "%d/%m/%Y %H:%M"
-      )
-      training["training_dt"] = naive_dt.replace(tzinfo=HKT)
-
-      if training.get("reminder_task"):
-        training["reminder_task"].cancel()
-      if training.get("auto_lock_task"):
-        training["auto_lock_task"].cancel()
-
-      training["reminder_task"] = asyncio.create_task(
-          send_reminder(training["host_mention"], training["training_dt"])
-      )
-      training["auto_lock_task"] = asyncio.create_task(
-          schedule_auto_lock(host_id, training["training_dt"])
-      )
-    except ValueError:
-      await ctx.send(
-          "Invalid time format for update! Please use: !update time DD/MM/YYYY"
-          " HH:MM"
-      )
-      return
-
-  elif field_clean in ["host"]:
-    training["host_mention"] = value.strip()
-
-  elif field_clean in ["traineequota", "quota"]:
-    training["quota"] = value.strip()
-
-  else:
-    await ctx.send("Invalid field! Choose from: time, host, or traineequota.")
-    return
-
-  if training.get("announcement_message"):
-    try:
-      await training["announcement_message"].delete()
-      if training["announcement_message"] in training["posted_messages"]:
-        training["posted_messages"].remove(training["announcement_message"])
-    except Exception:
-      pass
-
-  new_unix = int(training["training_dt"].timestamp())
-  timestamp_format = f"<t:{new_unix}:f> (<t:{new_unix}:R>)"
-
-  embed = discord.Embed(
-      title=f"MTB PCV Training - {timestamp_format}", color=discord.Color.blue()
-  )
-  embed.add_field(name="Host", value=training["host_mention"], inline=False)
-  embed.add_field(name="Trainee Quota", value=training["quota"], inline=False)
-
-  announcement_channel = bot.get_channel(ANNOUNCEMENT_CHANNEL_ID)
-  if announcement_channel:
-    content_msg = (
-        f"The training of {orig_timestamp_str} has been updated! Please check"
-        " the newest details as the following:"
-    )
-    new_ann_msg = await announcement_channel.send(
-        content=content_msg, embed=embed
-    )
-    training["announcement_message"] = new_ann_msg
-    training["posted_messages"].append(new_ann_msg)
-    save_trainings_state()
-    await ctx.send("Training announcement updated successfully!")
-  else:
-    await ctx.send("<#1223678863754657853> not found!")
-
-
-@bot.command()
-@has_role_or_above_position(TRAINING_DEPT_ROLE_ID)
-async def link(ctx, server_link: str):
-  """Usage: !link <server_link>."""
-  target_host_id = ctx.author.id
-
-  if target_host_id not in trainings:
-    if is_dept_manager()(ctx.author) and len(trainings) > 0:
-      target_host_id = list(trainings.keys())[-1]
-    else:
-      await ctx.send("You haven't announced the training yet!")
-      return
-
-  training = trainings[target_host_id]
-  unix_ts = int(training["training_dt"].timestamp())
-  time_display = f"<t:{unix_ts}:t>"
-
-  embed = discord.Embed(
-      title="MTB Training Centre Link",
-      description=(
-          f"The training scheduled for **{time_display}** is now starting,"
-          " please join the MTB Training Centre through this link:\n\n"
-          f"{server_link}\n\n"
-          f"Server will be locked at {time_display}."
-      ),
-      color=discord.Color.green(),
-  )
-
-  announcement_channel = bot.get_channel(ANNOUNCEMENT_CHANNEL_ID)
-  if announcement_channel:
-    link_msg = await announcement_channel.send(
-        content=TRAINEE_ROLE_PING, embed=embed
-    )
-    training["link_message"] = link_msg
-    training["link_posted"] = True
-    training["posted_messages"].append(link_msg)
-    save_trainings_state()
-
-    await ctx.send("Link has been announced to <#1223678863754657853>!")
-  else:
-    await ctx.send("<#1223678863754657853> not found!")
-
-
-@bot.command()
-@has_role_or_above_position(TRAINING_DEPT_ROLE_ID)
-async def full(ctx):
-  """Usage: !full."""
-  target_host_id = ctx.author.id
-
-  if target_host_id not in trainings:
-    if is_dept_manager()(ctx.author) and len(trainings) > 0:
-      target_host_id = list(trainings.keys())[-1]
-    else:
-      await ctx.send("You haven't announced the training yet!")
-      return
-
-  training = trainings[target_host_id]
-
-  if not training.get("link_posted"):
-    await ctx.send("You haven't posted the link yet!")
-    return
-
-  if training.get("auto_lock_task"):
-    training["auto_lock_task"].cancel()
-
-  announcement_channel = bot.get_channel(ANNOUNCEMENT_CHANNEL_ID)
-
-  if training.get("link_message"):
-    try:
-      await training["link_message"].delete()
-      if training["link_message"] in training["posted_messages"]:
-        training["posted_messages"].remove(training["link_message"])
-      training["link_message"] = None
-    except Exception:
-      pass
-
-  training["is_locked"] = True
-
-  if announcement_channel:
-    embed = discord.Embed(
-        title="Server Locked (Full)",
-        description=(
-            "Server locked due to maximum amount of trainee reached. Please"
-            " join the next session if you failed to join this session."
-        ),
-        color=discord.Color.red(),
-    )
-    full_msg = await announcement_channel.send(embed=embed)
-    training["posted_messages"].append(full_msg)
-    save_trainings_state()
-
-    await ctx.send("Server status updated to FULL and removed link!")
-  else:
-    await ctx.send("<#1223678863754657853> not found!")
-
-
-@bot.command()
-@has_role_or_above_position(TRAINING_DEPT_ROLE_ID)
-async def end(ctx):
-  """Usage: !end."""
-  target_host_id = ctx.author.id
-
-  if target_host_id not in trainings:
-    if is_dept_manager()(ctx.author) and len(trainings) > 0:
-      target_host_id = list(trainings.keys())[-1]
-    else:
-      await ctx.send("You haven't announced the training yet!")
-      return
-
-  training = trainings[target_host_id]
-
-  if not training.get("link_posted"):
-    await ctx.send("You haven't posted the link yet!")
-    return
-
-  if not training.get("is_locked"):
-    await ctx.send("The training has not ended")
-    return
-
-  for msg in training.get("posted_messages", []):
-    try:
-      await msg.delete()
-    except Exception as e:
-      print(f"Could not delete message: {e}")
-
-  unix_ts = int(training["training_dt"].timestamp())
-  training_time_str = f"<t:{unix_ts}:f>"
-
-  embed = discord.Embed(
-      title=f"Detailed feedback of the {training_time_str} session",
-      description=(
-          "If you need individual detailed result for this session, please"
-          " react to this message."
-      ),
-      color=discord.Color.blue(),
-  )
-
-  announcement_channel = bot.get_channel(ANNOUNCEMENT_CHANNEL_ID)
-  if announcement_channel:
-    await announcement_channel.send(embed=embed)
-
-    await ctx.send(
-        "Training status has updated to ENDED, detailed result reaction"
-        " message posted successfully!"
-    )
-    del trainings[target_host_id]
-    save_trainings_state()
-  else:
-    await ctx.send("<#1223678863754657853> not found!")
-
-
-# ==============================================================================
-# 5. DEPARTMENT HEAD & MANAGEMENT COMMANDS
-# ==============================================================================
-
-
-@bot.command()
-@has_role_or_above_position(DEPT_MANAGER_ROLE_ID)
-async def clear(ctx):
-  """Usage: !clear."""
-  for host_id, training in list(trainings.items()):
-    if training.get("reminder_task"):
-      training["reminder_task"].cancel()
-    if training.get("auto_lock_task"):
-      training["auto_lock_task"].cancel()
-
-    for msg in training.get("posted_messages", []):
-      try:
-        await msg.delete()
-      except Exception:
-        pass
-
-  trainings.clear()
-  save_trainings_state()
-
-  announcement_channel = bot.get_channel(ANNOUNCEMENT_CHANNEL_ID)
-  if announcement_channel:
-    try:
-      async for msg in announcement_channel.history(limit=50):
-        if msg.id in [TRAINING_PING_MESSAGE_ID, SHIFT_PING_MESSAGE_ID]:
-          continue
-
-        if msg.embeds:
-          for emb in msg.embeds:
-            if (
-                emb.title
-                and "Detailed feedback of the" in emb.title
-                and msg.author == bot.user
-            ):
-              try:
-                await msg.delete()
-              except Exception as e:
-                print(f"Could not delete feedback message {msg.id}: {e}")
-    except Exception as e:
-      print(f"Error checking channel history: {e}")
-
-  await ctx.send("Cleared all active training message(s).")
-
-
-@bot.command(name="dm")
-@has_role_or_above_position(DEPT_MANAGER_ROLE_ID)
-async def send_dm(ctx, target_user_id: int, *, message_text: str = ""):
-  """Usage: !dm <user_id> [message] (Attachments supported)."""
-  if not message_text and not ctx.message.attachments:
-    await ctx.send("Error: Please provide text content or attach a file.")
-    return
-
-  try:
-    target_user = bot.get_user(target_user_id) or await bot.fetch_user(
-        target_user_id
-    )
-    if not target_user:
-      await ctx.send("Error: User not found.")
-      return
-
-    send_files = [await att.to_file() for att in ctx.message.attachments]
-    log_files = [await att.to_file() for att in ctx.message.attachments]
-
-    sent_msg = await target_user.send(content=message_text, files=send_files)
-
-    channel = bot.get_channel(LOG_CHANNEL_ID)
-    if channel:
-      await channel.send(f"Successfully DMed `{target_user.id}`!")
-
-      copy_embed = discord.Embed(
-          title="Outgoing Message Copy",
-          description=(
-              message_text if message_text else "*[Attachment/File Only]*"
-          ),
-          color=discord.Color.green(),
-      )
-
-      copy_embed.set_footer(
-          text=(
-              f"Sender ID: {ctx.author.id} | Receiver ID: {target_user.id} |"
-              f" Message ID: {sent_msg.id}"
-          )
-      )
-
-      if ctx.message.attachments:
-        first_att = ctx.message.attachments[0]
-        if (
-            first_att.content_type
-            and first_att.content_type.startswith("image/")
-        ):
-          copy_embed.set_image(url=first_att.url)
-
-      await channel.send(embed=copy_embed, files=log_files)
-
-  except discord.Forbidden:
-    await ctx.send(
-        "Could not send DM. The user might have DMs disabled or blocked the"
-        " bot."
-    )
-  except Exception as e:
-    await ctx.send(f"Error sending message: {e}")
-
-
-@bot.command(name="dmclose")
-@has_role_or_above_position(DEPT_MANAGER_ROLE_ID)
-async def dm_close(ctx, target_user_id: int):
-  """Usage: !dmclose <user_id>"""
-  try:
-    target_user = bot.get_user(target_user_id) or await bot.fetch_user(
-        target_user_id
-    )
-    if not target_user:
-      await ctx.send("Error: Could not find user with that ID.")
-      return
-
-    closing_embed = discord.Embed(
-        title="Enquiry Closed",
-        description=(
-            "Thank you for contacting Metrobus Training Department. You may"
-            " contact us again if you have anymore enquiries."
-        ),
-        color=discord.Color.blue(),
-    )
-    try:
-      await target_user.send(embed=closing_embed)
-      dm_sent = True
-    except discord.Forbidden:
-      dm_sent = False
-
-    if target_user_id in user_active_dms:
-      del user_active_dms[target_user_id]
-
-    status_text = f"DM ticket for `{target_user_id}` has been closed."
-    if not dm_sent:
-      status_text += " (Note: Could not send DM to user - DMs may be closed)."
-
-    await ctx.send(status_text)
-
-  except Exception as e:
-    await ctx.send(f"Error executing !dmclose: {e}")
-
-
-@bot.command()
-@has_role_or_above_position(DEPT_MANAGER_ROLE_ID)
-async def text(ctx, channel_id: int, *, message_text: str):
-  """Usage: !text <channel_id> <message_content>."""
-  target_channel = bot.get_channel(channel_id)
-  if not target_channel:
-    try:
-      target_channel = await bot.fetch_channel(channel_id)
-    except Exception:
-      await ctx.send(
-          "Error: Could not find or access the specified channel ID."
-      )
-      return
-
-  try:
-    await target_channel.send(message_text)
-    await ctx.send(f"Message successfully sent to <#{channel_id}>!")
-  except Exception as e:
-    await ctx.send(f"Failed to send message: {e}")
-
-
-@bot.command()
-@has_role_or_above_position(DEPT_MANAGER_ROLE_ID)
-async def delete(ctx, message_id: int, target_channel_id: int = None):
-  """Usage: !delete <message_id> [channel_id]"""
-  msg_to_delete = None
-
-  if target_channel_id:
-    channel = bot.get_channel(target_channel_id) or await bot.fetch_channel(
-        target_channel_id
-    )
-    if channel:
-      try:
-        msg_to_delete = await channel.fetch_message(message_id)
-      except discord.NotFound:
-        await ctx.send("Error: Message not found in specified channel.")
+async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
+    if payload.message_id != REACTION_ROLE_MESSAGE_ID or payload.emoji.id != REACTION_ROLE_EMOJI_ID:
         return
-  else:
+
+    guild = bot.get_guild(payload.guild_id) or await bot.fetch_guild(payload.guild_id)
+    if not guild:
+        return
+
+    role = guild.get_role(SHIFT_PING_ROLE_ID)
+    if not role:
+        return
+
     try:
-      msg_to_delete = await ctx.channel.fetch_message(message_id)
+        member = await guild.fetch_member(payload.user_id)
     except discord.NotFound:
-      if ctx.guild:
-        for channel in ctx.guild.text_channels:
-          try:
-            msg_to_delete = await channel.fetch_message(message_id)
-            break
-          except (discord.NotFound, discord.Forbidden):
-            continue
+        return
 
-  if not msg_to_delete:
-    await ctx.send(
-        "Error: Could not find that message in any accessible channel."
+    if member and not member.bot:
+        try:
+            await member.remove_roles(role)
+            print(f"Removed role {role.name} from {member.display_name}")
+        except Exception as e:
+            print(f"Failed to remove role: {e}")
+
+# --- Commands ---
+
+@bot.command(name="help")
+async def help_cmd(ctx: commands.Context):
+    embed = discord.Embed(
+        title="NEXTransit Bot Command Help",
+        color=discord.Color.blue()
     )
-    return
 
-  try:
-    await msg_to_delete.delete()
-    if not isinstance(ctx.channel, discord.DMChannel):
-      try:
-        await ctx.message.delete()
-      except Exception:
+    # Public Available Commands
+    public_cmds = "`!version` - Displays current bot version and testing stage."
+    embed.add_field(name="Public Commands", value=public_cmds, inline=False)
+
+    is_tdp = False
+    is_dh = False
+
+    if isinstance(ctx.author, discord.Member):
+        is_dh = has_role_or_above(ctx.author, DEPARTMENT_HEAD_ROLE_ID)
+        is_tdp = is_dh or has_role_or_above(ctx.author, TRAINING_DEPT_ROLE_ID)
+
+    # Training Department Personnel Commands
+    if is_tdp:
+        tdp_cmds = (
+            "`!announce <PCV/SD> <YYYYMMDD> <HHMM> <Quota>` - Post a training session announcement.\n"
+            "`!update <variable> <value>` - Update session details (`type`, `date`, `time`, `traineequota`).\n"
+            "`!link <link>` - Post the game link and create a training communication thread.\n"
+            "`!full` - Lock the training session manually due to full quota.\n"
+            "`!end [emoji]` - End the session and archive the communication thread."
+        )
+        embed.add_field(name="Training Department Commands", value=tdp_cmds, inline=False)
+
+    # Department Head Commands
+    if is_dh:
+        dh_cmds = (
+            "`!clear [date/host]` - Delete all session messages and remove the communication thread.\n"
+            "`!delete <message_id>` - Delete a target message.\n"
+            "`!send <channel_id> <message>` - Send a message to a specific channel.\n"
+            "`!error` - Display the bot error code reference list."
+        )
+        embed.add_field(name="Department Head Commands", value=dh_cmds, inline=False)
+
+    await ctx.send(embed=embed)
+
+@bot.command(name="error")
+@is_department_head()
+async def error_cmd(ctx: commands.Context):
+    embed = discord.Embed(
+        title="NEXTransit Bot Error Code Reference List",
+        color=discord.Color.red()
+    )
+    error_codes = (
+        "`701`: Incorrect command format or invalid argument.\n"
+        "`702`: Failed to send message to target channel.\n"
+        "`703`: Insufficient rank/permission to execute command.\n"
+        "`704`: Command cooldown active or execution error.\n"
+        "`705`: Action unavailable (no active session or requirements not met).\n"
+        "`706`: No active session found to clear."
+    )
+    embed.add_field(name="Error Codes", value=error_codes, inline=False)
+    await ctx.send(embed=embed)
+
+@bot.command(name="version")
+async def version(ctx: commands.Context):
+    await ctx.send(f"**Bot Version:** {BOT_VERSION}\n**Stage:** {BOT_STAGE}")
+
+@bot.command(name="delete")
+@is_department_head()
+async def delete_cmd(ctx: commands.Context, message_id: int):
+    try:
+        target_msg = await ctx.channel.fetch_message(message_id)
+        await target_msg.delete()
+    except Exception:
         pass
-    await ctx.send(
-        f"Successfully deleted message `{message_id}` from"
-        f" {msg_to_delete.channel.mention}!",
-        delete_after=5,
-    )
-  except discord.Forbidden:
-    await ctx.send("Error: Bot lacks permission to delete that message.")
-  except Exception as e:
-    await ctx.send(f"Error deleting message: {e}")
 
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+
+@bot.command(name="send")
+@is_department_head()
+async def send_cmd(ctx: commands.Context, channel_id: int, *, message_content: str):
+    target_channel = bot.get_channel(channel_id)
+    if not target_channel:
+        try:
+            target_channel = await bot.fetch_channel(channel_id)
+        except Exception:
+            return
+
+    if target_channel:
+        await target_channel.send(content=message_content)
+
+@bot.command(name="announce")
+@commands.cooldown(1, 5, commands.BucketType.user)
+@is_training_or_head()
+async def announce(ctx: commands.Context, session_type: str, date_str: str, time_str: str, quota: int):
+    host_id = ctx.author.id
+    
+    if host_id in sessions and sessions[host_id]["active"]:
+        await ctx.send("You already have an active training session! Please end or clear it before announcing a new one.")
+        return
+
+    session_upper = session_type.upper()
+    if session_upper not in ["PCV", "SD"]:
+        await ctx.send("Please use the format !announce <PCV/SD> <YYYYMMDD> <HHMM> <TraineeQuota> `701`")
+        return
+
+    try:
+        tz_gmt8 = timezone(timedelta(hours=8))
+        dt_str = f"{date_str} {time_str}"
+        dt = datetime.strptime(dt_str, "%Y%m%d %H%M").replace(tzinfo=tz_gmt8)
+        unix_timestamp = int(dt.timestamp())
+    except ValueError:
+        await ctx.send("Please use the format !announce <PCV/SD> <YYYYMMDD> <HHMM> <TraineeQuota> `701`")
+        return
+
+    ping_role_content = f"<@&{TD_DRIVER_ROLE_ID}>" if session_upper == "PCV" else f"<@&{PCV_DRIVER_ROLE_ID}>"
+    embed = create_announcement_embed(session_upper, unix_timestamp, ctx.author.mention, quota)
+
+    try:
+        channel = bot.get_channel(PUBLIC_ANNOUNCEMENT_CHANNEL_ID) or await bot.fetch_channel(PUBLIC_ANNOUNCEMENT_CHANNEL_ID)
+        if channel:
+            ping_msg = await channel.send(content=ping_role_content)
+            ann_msg = await channel.send(embed=embed)
+            await ctx.send("Announcement successfully posted!")
+
+            sessions[host_id] = {
+                "active": True,
+                "session_type": session_upper,
+                "date_str": date_str,
+                "time_str": time_str,
+                "quota": quota,
+                "unix_timestamp": unix_timestamp,
+                "host_id": host_id,
+                "announcement_msg_id": ann_msg.id,
+                "ping_msg_id": ping_msg.id,
+                "reminder_sent": False,
+                "reminder_task": None,
+                "auto_lock_task": None,
+                "link_ping_msg_id": None,
+                "link_msg_id": None,
+                "thread_id": None,
+                "server_locked": False,
+                "lock_msg_id": None,
+                "track_date_key": date_str,
+                "messages_to_clear": [ping_msg.id, ann_msg.id]
+            }
+
+            save_sessions_to_file()
+
+            sessions[host_id]["reminder_task"] = asyncio.create_task(
+                schedule_training_reminder(host_id, ctx.author.mention, session_upper, unix_timestamp)
+            )
+            sessions[host_id]["auto_lock_task"] = asyncio.create_task(
+                schedule_auto_lock(host_id, unix_timestamp)
+            )
+        else:
+            await ctx.send("Unsuccessful excursion. Please contact developer. `702`")
+    except Exception:
+        await ctx.send("Unsuccessful excursion. Please contact developer. `702`")
+
+@bot.command(name="update")
+@commands.cooldown(1, 5, commands.BucketType.user)
+@is_training_or_head()
+async def update(ctx: commands.Context, var_type: str, *, new_value: str):
+    host_id = ctx.author.id
+    session = sessions.get(host_id)
+
+    if not session or not session["active"]:
+        await ctx.send("Wrong format! Please use !update <variable> <value> 701")
+        return
+
+    var_lower = var_type.lower()
+    if var_lower not in ["type", "date", "time", "traineequota"]:
+        await ctx.send("Wrong format! Please use !update <variable> <value> 701")
+        return
+
+    orig_timestamp = session["unix_timestamp"]
+    s_type = session["session_type"]
+    d_str = session["date_str"]
+    t_str = session["time_str"]
+    q_val = session["quota"]
+
+    if var_lower == "type":
+        val_upper = new_value.upper()
+        if val_upper not in ["PCV", "SD"]:
+            await ctx.send("Wrong format! Please use !update <variable> <value> 701")
+            return
+        s_type = val_upper
+    elif var_lower == "date":
+        d_str = new_value.strip()
+    elif var_lower == "time":
+        t_str = new_value.strip()
+    elif var_lower == "traineequota":
+        try:
+            q_val = int(new_value.strip())
+        except ValueError:
+            await ctx.send("Wrong format! Please use !update <variable> <value> 701")
+            return
+
+    try:
+        tz_gmt8 = timezone(timedelta(hours=8))
+        dt_full = f"{d_str} {t_str}"
+        dt = datetime.strptime(dt_full, "%Y%m%d %H%M").replace(tzinfo=tz_gmt8)
+        new_unix_ts = int(dt.timestamp())
+    except ValueError:
+        await ctx.send("Wrong format! Please use !update <variable> <value> 701")
+        return
+
+    session["session_type"] = s_type
+    session["date_str"] = d_str
+    session["time_str"] = t_str
+    session["quota"] = q_val
+    session["unix_timestamp"] = new_unix_ts
+    session["track_date_key"] = d_str
+
+    channel = bot.get_channel(PUBLIC_ANNOUNCEMENT_CHANNEL_ID) or await bot.fetch_channel(PUBLIC_ANNOUNCEMENT_CHANNEL_ID)
+    if channel and session["announcement_msg_id"]:
+        try:
+            old_msg = await channel.fetch_message(session["announcement_msg_id"])
+            await old_msg.delete()
+        except Exception:
+            pass
+
+    embed = create_announcement_embed(s_type, new_unix_ts, ctx.author.mention, q_val)
+    content_text = f"Details of the <t:{orig_timestamp}:F> training session has been updated! Please check the updated details as the following:"
+    
+    new_ann_msg = await channel.send(content=content_text, embed=embed)
+    session["announcement_msg_id"] = new_ann_msg.id
+    session["messages_to_clear"].append(new_ann_msg.id)
+
+    save_sessions_to_file()
+
+    if session["reminder_task"]:
+        session["reminder_task"].cancel()
+    if session["auto_lock_task"]:
+        session["auto_lock_task"].cancel()
+
+    session["reminder_task"] = asyncio.create_task(
+        schedule_training_reminder(host_id, ctx.author.mention, s_type, new_unix_ts)
+    )
+    session["auto_lock_task"] = asyncio.create_task(
+        schedule_auto_lock(host_id, new_unix_ts)
+    )
+
+    await ctx.send("Announcement successfully updated!")
+
+@bot.command(name="link")
+@is_training_or_head()
+async def link_cmd(ctx: commands.Context, *, link_text: str):
+    host_id = ctx.author.id
+    session = sessions.get(host_id)
+
+    if not session or not session["active"]:
+        await ctx.send("Announcement not found! `705`")
+        return
+        
+    if not session["reminder_sent"]:
+        await ctx.send("Training reminder has not been posted yet! `705`")
+        return
+
+    ann_channel = bot.get_channel(PUBLIC_ANNOUNCEMENT_CHANNEL_ID) or await bot.fetch_channel(PUBLIC_ANNOUNCEMENT_CHANNEL_ID)
+    if ann_channel:
+        ping_role_id = TD_DRIVER_ROLE_ID if session["session_type"] == "PCV" else PCV_DRIVER_ROLE_ID
+        ping_content = f"<@&{ping_role_id}>"
+
+        ts_formatted = f"<t:{session['unix_timestamp']}:F>"
+        s_type = session["session_type"]
+
+        embed = discord.Embed(
+            title="NEXTransit Training Centre Server Link",
+            description=f"The {ts_formatted} training is now available for joining, please join the server through this link: {link_text}",
+            color=discord.Color.blue()
+        )
+
+        ping_msg = await ann_channel.send(content=ping_content)
+        link_msg = await ann_channel.send(embed=embed)
+
+        tz_gmt8 = timezone(timedelta(hours=8))
+        title_dt = datetime.fromtimestamp(session["unix_timestamp"], tz=tz_gmt8)
+        title_time_str = title_dt.strftime("%Y/%m/%d %H:%M GMT+8")
+
+        thread_name = f"NEXTransit {s_type} {title_time_str} Training Communication"
+        thread = await ann_channel.create_thread(
+            name=thread_name,
+            type=discord.ChannelType.public_thread
+        )
+
+        thread_first_msg = (
+            f"**THIS IS A COMMUNICATION THREAD FOR INSTRUCTOR AND TRAINEES WHO ARE PARTICIPATING IN THE {ts_formatted} {s_type} TRAINING SESSION.**\n\n"
+            f"Session Host: {ctx.author.mention}"
+        )
+        await thread.send(content=thread_first_msg)
+
+        session["link_ping_msg_id"] = ping_msg.id
+        session["link_msg_id"] = link_msg.id
+        session["thread_id"] = thread.id
+        session["messages_to_clear"].extend([ping_msg.id, link_msg.id])
+
+        save_sessions_to_file()
+        await ctx.send("Link and communication thread successfully posted!")
+
+@bot.command(name="full")
+@is_training_or_head()
+async def full_cmd(ctx: commands.Context):
+    host_id = ctx.author.id
+    session = sessions.get(host_id)
+
+    if not session or not session["active"] or session["link_msg_id"] is None:
+        await ctx.send("Announcement not found! `705`")
+        return
+
+    ann_channel = bot.get_channel(PUBLIC_ANNOUNCEMENT_CHANNEL_ID) or await bot.fetch_channel(PUBLIC_ANNOUNCEMENT_CHANNEL_ID)
+    if ann_channel:
+        for msg_id in [session["link_msg_id"], session["link_ping_msg_id"]]:
+            if msg_id:
+                try:
+                    link_msg = await ann_channel.fetch_message(msg_id)
+                    await link_msg.delete()
+                except Exception:
+                    pass
+
+        embed = discord.Embed(
+            title="Server Locked",
+            description="Server locked due to maximum number of trainee quota reached. Please join the next session if you failed to join this session.",
+            color=discord.Color.red()
+        )
+        lock_msg = await ann_channel.send(embed=embed)
+        session["server_locked"] = True
+        session["lock_msg_id"] = lock_msg.id
+        session["messages_to_clear"].append(lock_msg.id)
+
+        save_sessions_to_file()
+        await ctx.send("Server locked status updated!")
+
+@bot.command(name="end")
+@is_training_or_head()
+async def end_cmd(ctx: commands.Context, emoji: str = None):
+    host_id = ctx.author.id
+    session = sessions.get(host_id)
+
+    if not session or not session["active"] or not session["server_locked"]:
+        await ctx.send("The training cannot end since it haven't started. `705`")
+        return
+
+    ann_channel = bot.get_channel(PUBLIC_ANNOUNCEMENT_CHANNEL_ID) or await bot.fetch_channel(PUBLIC_ANNOUNCEMENT_CHANNEL_ID)
+    if ann_channel:
+        if session["lock_msg_id"]:
+            try:
+                lock_msg = await ann_channel.fetch_message(session["lock_msg_id"])
+                await lock_msg.delete()
+            except Exception:
+                pass
+
+        ts = session["unix_timestamp"]
+        embed = discord.Embed(
+            title=f"Detailed Result of the <t:{ts}:F> Session",
+            color=discord.Color.blue()
+        )
+        
+        if emoji:
+            embed.description = f"If you need individual detailed result of this session, please react {emoji} to this message. Please make sure your Discord direct message permission from non-friends is opened before doing so."
+        else:
+            embed.description = "If you need individual detailed result of this session, please react to this message. Please make sure your Discord direct message permission from non-friends is opened before doing so."
+
+        end_msg = await ann_channel.send(embed=embed)
+        session["messages_to_clear"].append(end_msg.id)
+
+        if session["thread_id"]:
+            try:
+                thread = bot.get_channel(session["thread_id"]) or await bot.fetch_channel(session["thread_id"])
+                if thread:
+                    await thread.send("THIS TRAINING HAS CONCLUDED. IF YOU HAVE ANYMORE ENQUIRY PLEASE OPEN A TICKET OR CONTACT THE INSTRUCTOR DIRECTLY.")
+                    await thread.edit(archived=True, locked=True)
+            except Exception as e:
+                print(f"Error closing thread: {e}")
+
+        save_sessions_to_file()
+        await ctx.send("Training successfully ended!")
+
+@bot.command(name="clear")
+@is_department_head()
+async def clear_cmd(ctx: commands.Context, target_arg: str = None):
+    target_host_id = ctx.author.id
+
+    if target_arg:
+        clean_id = target_arg.replace("<@", "").replace(">", "").replace("!", "")
+        if clean_id.isdigit():
+            target_host_id = int(clean_id)
+
+    session = sessions.get(target_host_id)
+
+    if not session or not session["active"]:
+        await ctx.send("There is no message to be cleared. `706`")
+        return
+
+    if session["reminder_task"]:
+        session["reminder_task"].cancel()
+    if session["auto_lock_task"]:
+        session["auto_lock_task"].cancel()
+
+    # Clear posted messages in the announcement channel
+    ann_channel = bot.get_channel(PUBLIC_ANNOUNCEMENT_CHANNEL_ID) or await bot.fetch_channel(PUBLIC_ANNOUNCEMENT_CHANNEL_ID)
+    if ann_channel:
+        for msg_id in session["messages_to_clear"]:
+            try:
+                msg = await ann_channel.fetch_message(msg_id)
+                if msg.author.id == bot.user.id:
+                    await msg.delete()
+            except Exception:
+                pass
+
+    # Clear posted messages in internal channel
+    internal_channel = bot.get_channel(INSTRUCTOR_COMM_CHANNEL_ID) or await bot.fetch_channel(INSTRUCTOR_COMM_CHANNEL_ID)
+    if internal_channel:
+        for msg_id in session["messages_to_clear"]:
+            try:
+                msg = await internal_channel.fetch_message(msg_id)
+                if msg.author.id == bot.user.id:
+                    await msg.delete()
+            except Exception:
+                pass
+
+    # Delete communication thread
+    if session["thread_id"]:
+        try:
+            thread = bot.get_channel(session["thread_id"]) or await bot.fetch_channel(session["thread_id"])
+            if thread:
+                await thread.delete()
+        except Exception as e:
+            print(f"Error deleting thread during clear: {e}")
+
+    # Remove session from active sessions dictionary
+    del sessions[target_host_id]
+    save_sessions_to_file()
+
+    await ctx.send("Training messages and communication thread successfully cleared!")
+
+# --- Error Handlers ---
+
+@announce.error
+async def announce_error(ctx: commands.Context, error: Exception):
+    if isinstance(error, commands.CommandOnCooldown):
+        await ctx.send("Unsuccessful excursion. Please contact developer. `704`")
+    elif isinstance(error, (commands.MissingRequiredArgument, commands.BadArgument)):
+        await ctx.send("Please use the format !announce <PCV/SD> <YYYYMMDD> <HHMM> <TraineeQuota> `701`")
+    elif isinstance(error, commands.CheckFailure):
+        pass
+    else:
+        await ctx.send("Unsuccessful excursion. Please contact developer. `704`")
+
+@update.error
+async def update_error(ctx: commands.Context, error: Exception):
+    if isinstance(error, commands.CommandOnCooldown):
+        await ctx.send("Wrong format! Please use !update <variable> <value> 704")
+    elif isinstance(error, (commands.MissingRequiredArgument, commands.BadArgument)):
+        await ctx.send("Wrong format! Please use !update <variable> <value> 701")
+    elif isinstance(error, commands.CheckFailure):
+        pass
+    else:
+        await ctx.send("Wrong format! Please use !update <variable> <value> 701")
 
 TOKEN = os.getenv("DISCORD_TOKEN")  
 
