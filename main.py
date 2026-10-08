@@ -33,8 +33,9 @@ REACTION_ROLE_MESSAGE_ID = int(os.getenv("REACTION_ROLE_MESSAGE_ID", "1557671185
 REACTION_ROLE_EMOJI_ID = int(os.getenv("REACTION_ROLE_EMOJI_ID", "1555074907887501363"))
 
 # Bot Status & Version Definitions
-BOT_VERSION = "1.9.4"
-BOT_STAGE = "Testing Stage"
+BOT_VERSION = "1.0"
+BOT_STAGE = "Public Release"
+LAST_UPDATE = "20261008 1649"
 
 # Bot Setup with explicitly enabled reaction intents
 intents = discord.Intents.default()
@@ -313,7 +314,7 @@ async def help_cmd(ctx: commands.Context):
         is_dh = has_role_or_above(ctx.author, DEPARTMENT_HEAD_ROLE_ID)
         is_tdp = is_dh or has_role_or_above(ctx.author, TRAINING_DEPT_ROLE_ID)
 
-    # Training Department Personnel Commands
+    # Training Department Pegrsonnel Commands
     if is_tdp:
         tdp_cmds = (
             "`!announce <PCV/SD> <YYYYMMDD> <HHMM> <Quota>` - Post a training session announcement.\n"
@@ -356,7 +357,7 @@ async def error_cmd(ctx: commands.Context):
 
 @bot.command(name="version")
 async def version(ctx: commands.Context):
-    await ctx.send(f"**Bot Version:** {BOT_VERSION}\n**Stage:** {BOT_STAGE}")
+    await ctx.send(f"**Bot Version:** {BOT_VERSION}\n**Stage:** {BOT_STAGE}\n**Last updated on:** {LAST_UPDATE}")
 
 @bot.command(name="delete")
 @is_department_head()
