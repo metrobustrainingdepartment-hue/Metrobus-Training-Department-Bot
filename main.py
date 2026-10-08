@@ -755,6 +755,5 @@ async def update_error(ctx: commands.Context, error: Exception):
     else:
         await ctx.send("Wrong format! Please use !update <variable> <value> 701")
         
-TOKEN = os.getenv("DISCORD_TOKEN")  
-
+TOKEN = os.getenv("TOKEN") or os.getenv("DISCORD_TOKEN")
 bot.run(TOKEN)
