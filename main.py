@@ -4,9 +4,6 @@ import asyncio
 from datetime import datetime, timezone, timedelta
 import discord
 from discord.ext import commands
-import nest_asyncio
-
-nest_asyncio.apply()
 
 # File path for saving active sessions state across restarts
 SESSIONS_FILE = "sessions.json"
@@ -754,6 +751,9 @@ async def update_error(ctx: commands.Context, error: Exception):
         pass
     else:
         await ctx.send("Wrong format! Please use !update <variable> <value> 701")
-        
+
 TOKEN = os.getenv("TOKEN") or os.getenv("DISCORD_TOKEN")
+if not TOKEN:
+    raise ValueError("Bot TOKEN environment variable is missing!")
+
 bot.run(TOKEN)
